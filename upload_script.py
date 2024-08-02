@@ -191,15 +191,41 @@ def upload_to_snowflake(file):
 
 # Load data into tables
 def load_data_into_table(file, target_schema, table_name):
+    temp_table = f"{table_name}_TEMP"
+
+    # Create temporary table
+    create_temp_table_command = f"""
+    CREATE OR REPLACE TABLE {target_schema}.{temp_table} LIKE {target_schema}.{table_name};
+    """
+    cur.execute(create_temp_table_command)
+    print(f"Temporary table {target_schema}.{temp_table} created successfully.")
+
+    # Copy data into the temporary table
     copy_command = f"""
-    COPY INTO {target_schema}.{table_name}
+    COPY INTO {target_schema}.{temp_table}
     FROM @~/staged/{os.path.basename(file)}
     FILE_FORMAT = (TYPE = 'JSON', STRIP_OUTER_ARRAY = TRUE)
     MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
-    ON_ERROR = 'CONTINUE'
+    ON_ERROR = 'CONTINUE';
     """
     cur.execute(copy_command)
-    print(f"Data loaded into table {target_schema}.{table_name} successfully.")
+    print(f"Data loaded into temporary table {target_schema}.{temp_table} successfully.")
+
+    # Insert unique data into the target table
+    insert_unique_command = f"""
+    INSERT INTO {target_schema}.{table_name}
+    SELECT DISTINCT * FROM {target_schema}.{temp_table};
+    """
+    cur.execute(insert_unique_command)
+    print(f"Unique data loaded into table {target_schema}.{table_name} successfully.")
+
+    # Drop the temporary table
+    drop_temp_table_command = f"""
+    DROP TABLE {target_schema}.{temp_table};
+    """
+    cur.execute(drop_temp_table_command)
+    print(f"Temporary table {target_schema}.{temp_table} dropped successfully.")
+
 
 # Back up and copy the tables
 def backup_and_copy_tables(source_schema, target_schema):
@@ -412,28 +438,24 @@ def create_full_vehicle_table(schema_name, combined_table_name):
         cur.execute(create_table_sql)
         print(f"Combined table {combined_table_name} created in {schema_name} schema with the necessary joins.")
 
-        # Move the FULL_VEHICLE table to REFERENCES schema
-        move_full_vehicle_to_references(schema_name, combined_table_name)
 
     except snowflake.connector.errors.ProgrammingError as e:
         print(f"Error occurred while creating the initial Vehicle table: {e}")
 
 def move_full_vehicle_to_references(source_schema, table_name):
     try:
-        target_schema = 'REFERENCES'
-
-        # Ensure the target schema exists
-        create_schema_if_not_exists(target_schema)
+        target_schema = 'REFERENCES.AUTOCARE_VCDB'
 
         # Switch to the source schema
         cur.execute(f"USE SCHEMA {source_schema}")
+
+        # Drop the table if it exists in the target schema
+        cur.execute(f"DROP TABLE IF EXISTS {target_schema}.{table_name}")
 
         # Move the FULL_VEHICLE table from the source schema to the target schema
         cur.execute(f"CREATE TABLE {target_schema}.{table_name} LIKE {source_schema}.{table_name}")
         cur.execute(f"INSERT INTO {target_schema}.{table_name} SELECT * FROM {source_schema}.{table_name}")
         print(f"Table {source_schema}.{table_name} moved to {target_schema}.{table_name}")
-
-        # Drop the table from the source schema
 
 
     except snowflake.connector.errors.ProgrammingError as e:
@@ -460,6 +482,7 @@ for json_file in extracted_files:
         upload_to_snowflake(json_file)
         load_data_into_table(json_file, f'{sf_database2}.{target_schema}', table_name)
 backup_and_copy_tables(f'{sf_database}.{source_schema}', f'{sf_database2}.{target_schema}')
+
 move_tables(f'{sf_database}.{source_schema}', f'{sf_database2}.{target_schema}')
 
 
@@ -473,6 +496,8 @@ if args.keyword == 'VCDB':
     # Execute the process
     try:
         create_full_vehicle_table(f'{sf_database2}.{target_schema}', 'FULL_VEHICLE')
+        move_full_vehicle_to_references(f'{sf_database2}.{target_schema}', 'FULL_VEHICLE')
+
 
     except Exception as e:
         print(f"Error occurred: {e}")
